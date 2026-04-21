@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# screenrec — macOS screen + camera (PiP) recorder with mic audio.
+# Stop recording by pressing `q` in the terminal, or Ctrl+C.
+
+set -euo pipefail
+
+CAMERA_IDX=0
+SCREEN_IDX=3
+AUDIO_IDX=1
+OUT=""
+CAM_WIDTH=320
+MARGIN=24
+FPS=30
+BITRATE=6M
+AUDIO_CH=""
+AUDIO_SR=""
+SCREEN_W=1920
+AUDIO_OFFSET_MS=100
+CORNER_R=24
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  -c N     camera device index       (default: $CAMERA_IDX)
+  -s N     screen device index       (default: $SCREEN_IDX)
+  -a N     audio device index        (default: $AUDIO_IDX — use -l to find AirPods)
+  -o FILE  output file (.mov/.mp4)   (default: recording_TIMESTAMP.mov)
+  -w N     webcam overlay width px   (default: $CAM_WIDTH)
+  -m N     margin from edges px      (default: $MARGIN)
+  -f N     framerate                 (default: $FPS)
+  -b RATE  video bitrate             (default: $BITRATE)
+  -W N     max screen width px        (default: native; set N>0 for CPU downscale)
+  -D MS    delay audio by MS ms       (default: $AUDIO_OFFSET_MS — positive shifts audio later to match video)
+  -R N     camera corner radius px    (default: $CORNER_R; 0 = square corners)
+  -A       AirPods mode: forces mono 16 kHz on audio input
+  -l       list AVFoundation devices and exit
+  -h       show this help
+
+First run will trigger macOS prompts for Screen Recording, Camera, and
+Microphone permissions for your terminal app. Approve all three, then rerun.
+Press q (in this terminal) to stop cleanly — Ctrl+C works but may leave the
+last second untrimmed.
+EOF
+}
+
+list_devices() {
+  cat <<'GUIDE'
+──────────────────────────────────────────────────────────────
+  screenrec — pick your mic from the AUDIO list below,
+  then start recording by typing:
+
+      audio <idx>
+
+  e.g.  audio 0   (AirPods Pro if it's first in the list)
+──────────────────────────────────────────────────────────────
+GUIDE
+  ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 \
+    | grep -E "AVFoundation (video|audio) devices|\[[0-9]+\]" || true
+}
+
+# Subcommand: `screenrec diag [audio_idx]` — progressive 5s tests to locate pipeline bottleneck
+if [[ "${1:-}" == "diag" ]]; then
+  AIDX="${2:-0}"
+  mkdir -p logs
+  STAMP=$(date +%Y%m%d_%H%M%S)
+  DIR="logs/diag_${STAMP}"
+  mkdir -p "$DIR"
+  SEC=5
+
+  measure() {
+    local label=$1; shift
+    local logf="$DIR/${label}.log"
+    echo "━━━ $label ━━━"
+    "$@" 2> >(tee "$logf" >&2) >/dev/null
+    grep -oE 'frame=[[:space:]]*[0-9]+|speed=[[:space:]]*[0-9.]+x|dup=[[:space:]]*[0-9]+|drop=[[:space:]]*[0-9]+' "$logf" | tail -4
+    echo
+  }
+
+  # 1: raw screen capture only (no filter, no encode) — establishes capture ceiling
+  measure "1_screen_null" ffmpeg -hide_banner -loglevel warning -stats \
+    -f avfoundation -pixel_format nv12 -capture_cursor 1 -i "${SCREEN_IDX}:none" \
+    -t $SEC -c:v rawvideo -f null -
+
+  # 2: screen → h264_videotoolbox encode, no overlay
+  measure "2_screen_enc" ffmpeg -hide_banner -loglevel warning -stats \
+    -f avfoundation -pixel_format nv12 -capture_cursor 1 -i "${SCREEN_IDX}:none" \
+    -t $SEC -pix_fmt nv12 -c:v h264_videotoolbox -b:v 6M -f null -
+
+  # 3: screen + camera → overlay → encode (with scale+fps normalization)
+  measure "3_screen_cam_enc" ffmpeg -hide_banner -loglevel warning -stats \
+    -f avfoundation -pixel_format nv12 -capture_cursor 1 -i "${SCREEN_IDX}:none" \
+    -f avfoundation -pixel_format nv12 -framerate 30 -video_size 1280x720 -i "${CAMERA_IDX}:none" \
+    -filter_complex_threads 4 \
+    -filter_complex "[0:v]scale=1920:-2,fps=30[scr];[1:v]scale=320:-2,setsar=1,fps=30[cam];[scr][cam]overlay=W-w-24:H-h-24:shortest=0:repeatlast=1:eof_action=pass[v]" \
+    -map "[v]" -t $SEC -pix_fmt nv12 -c:v h264_videotoolbox -b:v 6M -f null -
+
+  # 4: full pipeline incl. audio (mimics real recording)
+  measure "4_full" ffmpeg -hide_banner -loglevel warning -stats \
+    -f avfoundation -pixel_format nv12 -capture_cursor 1 -i "${SCREEN_IDX}:none" \
+    -f avfoundation -pixel_format nv12 -framerate 30 -video_size 1280x720 -i "${CAMERA_IDX}:none" \
+    -f avfoundation -i ":${AIDX}" \
+    -filter_complex_threads 4 \
+    -filter_complex "[0:v]scale=1920:-2,fps=30[scr];[1:v]scale=320:-2,setsar=1,fps=30[cam];[scr][cam]overlay=W-w-24:H-h-24:shortest=0:repeatlast=1:eof_action=pass[v]" \
+    -map "[v]" -map 2:a -t $SEC -pix_fmt nv12 -c:v h264_videotoolbox -b:v 6M -c:a aac -b:a 96k -f null -
+
+  echo "Logs: $DIR/"
+  echo
+  echo "Interpretation:"
+  echo "  If test 2 drops fps → encoder bottleneck at 3024×1964"
+  echo "  If test 3 drops fps → overlay/camera sync bottleneck"
+  echo "  If test 4 drops fps → audio (AirPods) is stealing cycles; try diag with -a 1 (MacBook mic)"
+  exit 0
+fi
+
+# Subcommand: `screenrec audio N [extra ffmpeg-ish args]` — shortcut for -a N
+if [[ "${1:-}" == "audio" ]]; then
+  shift
+  if [[ $# -lt 1 || ! "$1" =~ ^[0-9]+$ ]]; then
+    echo "Usage: $(basename "$0") audio <idx>   (run with -l to list devices)" >&2
+    exit 1
+  fi
+  AUDIO_IDX=$1
+  shift
+  set -- -a "$AUDIO_IDX" "$@"
+fi
+
+while getopts "c:s:a:o:w:m:f:b:W:D:R:Alh" opt; do
+  case $opt in
+    c) CAMERA_IDX=$OPTARG ;;
+    s) SCREEN_IDX=$OPTARG ;;
+    a) AUDIO_IDX=$OPTARG ;;
+    o) OUT=$OPTARG ;;
+    w) CAM_WIDTH=$OPTARG ;;
+    m) MARGIN=$OPTARG ;;
+    f) FPS=$OPTARG ;;
+    b) BITRATE=$OPTARG ;;
+    W) SCREEN_W=$OPTARG ;;
+    D) AUDIO_OFFSET_MS=$OPTARG ;;
+    R) CORNER_R=$OPTARG ;;
+    A) ;;  # AirPods flag is now a no-op: avfoundation negotiates rate from the device.
+    l) list_devices; exit 0 ;;
+    h) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+done
+
+AUDIO_OFFSET_SEC=$(awk -v ms="$AUDIO_OFFSET_MS" 'BEGIN{printf "%.3f", ms/1000}')
+
+if [[ "$CORNER_R" -gt 0 ]]; then
+  CAM_PIP_TAIL=",format=yuva420p,geq=lum=lum(X\\,Y):cb=cb(X\\,Y):cr=cr(X\\,Y):a=if(lt(hypot(max(0\\,abs(X-W/2)-(W/2-${CORNER_R}))\\,max(0\\,abs(Y-H/2)-(H/2-${CORNER_R})))\\,${CORNER_R})\\,255\\,0)"
+else
+  CAM_PIP_TAIL=""
+fi
+
+if [[ "$SCREEN_W" == "0" ]]; then
+  SCREEN_SCALE="null"
+else
+  SCREEN_SCALE="scale=${SCREEN_W}:-2:flags=fast_bilinear"
+fi
+
+TS=$(date +%Y%m%d_%H%M%S)
+if [[ -z "$OUT" ]]; then
+  OUT_BASE="recording_${TS}"
+  OUT_DIR="."
+else
+  OUT_DIR=$(dirname "$OUT")
+  OUT_NAME=$(basename "$OUT")
+  OUT_BASE="${OUT_NAME%.*}"
+fi
+OUT_COMBINED="${OUT_DIR}/${OUT_BASE}_combined.mov"
+OUT_SCREEN="${OUT_DIR}/${OUT_BASE}_screen.mov"
+OUT_CAMERA="${OUT_DIR}/${OUT_BASE}_camera.mov"
+OUT="$OUT_COMBINED"
+
+LOG_DIR="logs"
+mkdir -p "$LOG_DIR"
+LOG_BASE="${LOG_DIR}/${TS}"
+FFLOG="${LOG_BASE}.ffmpeg.log"
+STATS="${LOG_BASE}.stats.log"
+PROBE_LOG="${LOG_BASE}.probe.log"
+CMD_LOG="${LOG_BASE}.cmd.log"
+
+# Run ffmpeg with -report on to get a verbose log file automatically.
+export FFREPORT="file=${LOG_BASE}.ffreport.log:level=40"
+
+FFMPEG_ARGS=(
+  -hide_banner -loglevel info -stats -progress "$STATS"
+  -thread_queue_size 4096 -probesize 50M -analyzeduration 2M
+  -f avfoundation -capture_cursor 1 -pixel_format nv12
+    -i "${SCREEN_IDX}:none"
+  -thread_queue_size 4096
+  -f avfoundation -framerate 30 -video_size 1280x720 -pixel_format nv12
+    -i "${CAMERA_IDX}:none"
+  -thread_queue_size 4096 -itsoffset "${AUDIO_OFFSET_SEC}"
+  -f avfoundation ${AUDIO_CH} ${AUDIO_SR}
+    -i ":${AUDIO_IDX}"
+  -filter_complex_threads 4
+  -filter_complex "[0:v]${SCREEN_SCALE},fps=${FPS},split=2[scr_full][scr_pip];[1:v]fps=${FPS},split=2[cam_full][cam_src];[cam_src]scale=${CAM_WIDTH}:-2:flags=fast_bilinear,setsar=1${CAM_PIP_TAIL}[cam_pip];[scr_pip][cam_pip]overlay=W-w-${MARGIN}:H-h-${MARGIN}:shortest=0:repeatlast=1:eof_action=pass[v]"
+  -map "[v]"        -map 2:a -fps_mode cfr -r "$FPS" -pix_fmt nv12 -c:v h264_videotoolbox -b:v "$BITRATE" -c:a aac -b:a 96k -movflags +faststart "$OUT_COMBINED"
+  -map "[scr_full]" -map 2:a -fps_mode cfr -r "$FPS" -pix_fmt nv12 -c:v h264_videotoolbox -b:v "$BITRATE" -c:a aac -b:a 96k -movflags +faststart "$OUT_SCREEN"
+  -map "[cam_full]" -map 2:a -fps_mode cfr -r "$FPS" -pix_fmt nv12 -c:v h264_videotoolbox -b:v "$BITRATE" -c:a aac -b:a 96k -movflags +faststart "$OUT_CAMERA"
+)
+
+{
+  echo "# screenrec invocation"
+  echo "timestamp   : $TS"
+  echo "output      : $OUT"
+  echo "screen idx  : $SCREEN_IDX   screen_w: $SCREEN_W"
+  echo "camera idx  : $CAMERA_IDX   cam_w: $CAM_WIDTH  margin: $MARGIN"
+  echo "audio idx   : $AUDIO_IDX   extra: '${AUDIO_CH} ${AUDIO_SR}'"
+  echo "fps         : $FPS   bitrate: $BITRATE"
+  echo "ffmpeg ver  : $(ffmpeg -hide_banner -version | head -1)"
+  echo
+  echo "# devices"
+  ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 \
+    | grep -E "AVFoundation (video|audio) devices|\[[0-9]+\]" || true
+  echo
+  echo "# command"
+  printf '%q ' ffmpeg "${FFMPEG_ARGS[@]}"
+  echo
+} > "$CMD_LOG"
+
+echo "→ Outputs: $OUT_COMBINED"
+echo "         $OUT_SCREEN"
+echo "         $OUT_CAMERA"
+echo "→ Screen : [$SCREEN_IDX]   Camera: [$CAMERA_IDX]   Audio: [$AUDIO_IDX]"
+echo "→ PiP    : ${CAM_WIDTH}px wide, r=${CORNER_R}, ${MARGIN}px from bottom-right"
+echo "→ Logs   : $LOG_BASE.*"
+echo "→ Press q to stop."
+echo
+
+# tee ffmpeg stderr to a log file and the terminal
+set +e
+ffmpeg "${FFMPEG_ARGS[@]}" 2> >(tee "$FFLOG" >&2)
+EXIT=$?
+set -e
+
+echo
+echo "→ ffmpeg exited with code $EXIT"
+
+# After-the-fact analysis
+{
+  for f in "$OUT_COMBINED" "$OUT_SCREEN" "$OUT_CAMERA"; do
+    [[ -f "$f" ]] || continue
+    echo "# ===== $(basename "$f") ====="
+    ffprobe -v error -show_format -show_streams -of default "$f"
+    echo
+    echo "# packet count + first/last PTS per stream"
+    ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,dts_time -of csv=p=0 "$f" | awk -F, 'NR==1{first=$1} {last=$1; n++} END{printf "video: %d packets, first_pts=%s, last_pts=%s\n", n, first, last}'
+    ffprobe -v error -select_streams a:0 -show_entries packet=pts_time,dts_time -of csv=p=0 "$f" | awk -F, 'NR==1{first=$1} {last=$1; n++} END{printf "audio: %d packets, first_pts=%s, last_pts=%s\n", n, first, last}'
+    echo
+  done
+} > "$PROBE_LOG" 2>&1
+[[ -s "$PROBE_LOG" ]] && echo "→ Probe  : $PROBE_LOG"
+tail -n 20 "$FFLOG" | grep -E "frame=|speed=|bitrate=|drop|dup|Error|error|warning" | tail -n 8 || true
+
+exit $EXIT
