@@ -28,6 +28,9 @@
       "category": "public.app-category.video",
       "target": "dmg",
       "icon": "build/icon.icns"
+    },
+    "dmg": {
+      "artifactName": "demo-recorder.dmg"
     }
   },
   "devDependencies": {
